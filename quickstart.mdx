@@ -1,80 +1,138 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get started with Gemma 3 Inference Engine"
+description: "Install dependencies, get Hugging Face model access, and run your first Gemma-3 inference in five steps using direct generation or the API server."
 ---
 
-## Get started in three steps
+This guide walks you from a fresh environment to a running inference session. You can either run generation directly with `python main.py` or serve the OpenAI-compatible API with `python -m openai_api.run`. Both paths are covered below.
 
-Get your documentation site running locally and make your first customization.
+<Note>
+  You need approved access to the Gemma checkpoints on Hugging Face before the first download. Visit [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) and request access. Once approved, run `huggingface-cli login` with your token.
+</Note>
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Install Python dependencies">
+    Install the required packages with pip:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    python -m pip install torch tokenizers safetensors huggingface_hub fastapi uvicorn pydantic starlette
+    ```
 
-### Step 2: Deploy your changes
+    For the optional benchmark scripts, also install:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    python -m pip install pandas
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    <Tip>
+      Python 3.10 or later is required. The engine uses built-in type syntax like `list[int]` and `set[int]`.
+    </Tip>
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Get Hugging Face model access">
+    The engine downloads weights from `google/gemma-3-270m-it` (instruct) or `google/gemma-3-270m` (base) on first run.
 
-### Step 3: Go live
+    1. Go to [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) and request access
+    2. Once approved, authenticate your environment:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    huggingface-cli login
+    ```
+
+    If you already have the model files locally, place them in a directory named `gemma-3-270m-it/` (for the instruct model) or `gemma-3-270m/` (for the base model) in the project root. The engine will use local files if `model.safetensors` and `tokenizer.json` are present, skipping the download.
+  </Step>
+
+  <Step title="Run direct inference">
+    The simplest way to test the engine is with `python main.py`. This loads the model, tokenizes a prompt, and streams output tokens to stdout:
+
+    ```bash
+    python main.py
+    ```
+
+    The default `RunConfig` uses these settings:
+
+    ```python
+    @dataclass
+    class RunConfig:
+        choose_model: str = "270m"
+        use_instruct_model: bool = True
+        prompt: str = "Give me a short introduction to large language models."
+        max_new_tokens: int = 180
+        temperature: float = 0.8
+        top_p: float = 0.9
+        top_k: int = 50
+        repetition_penalty: float = 1.1
+    ```
+
+    Edit `RunConfig` in `main.py` to change the prompt or sampling parameters.
+
+    <Tip>
+      Device selection is automatic: CUDA is used if available, then Apple MPS, then CPU. GPU memory usage is printed after generation when running on CUDA.
+    </Tip>
+  </Step>
+
+  <Step title="Start the API server">
+    Start the OpenAI-compatible HTTP server:
+
+    ```bash
+    python -m openai_api.run
+    ```
+
+    The server loads the model during startup (not on the first request). Wait for the model to finish loading before sending requests — you can poll the readiness probe:
+
+    ```bash
+    curl http://localhost:8000/readyz
+    # Returns {"status": "ready"} when the model is loaded
+    ```
+  </Step>
+
+  <Step title="Query the API">
+    Use the included query script:
+
+    ```bash
+    python query_fastapi.py --stream --prompt "Give me one short line about LLM inference."
+    ```
+
+    Or use `curl` directly:
+
+    ```bash
+    curl -X POST http://localhost:8000/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{
+        "model": "gemma-3-270m-it",
+        "messages": [{"role": "user", "content": "What is LLM inference?"}],
+        "max_tokens": 100
+      }'
+    ```
+
+    You can also use any OpenAI-compatible client by pointing it at `http://localhost:8000/v1`:
+
+    ```python
+    from openai import OpenAI
+
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+    response = client.chat.completions.create(
+        model="gemma-3-270m-it",
+        messages=[{"role": "user", "content": "What is LLM inference?"}],
+        max_tokens=100,
+    )
+    print(response.choices[0].message.content)
+    ```
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand how the model, engine, and API layers fit together
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Tune engine settings, KV cache size, and sampling parameters
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full HTTP and Python API documentation
+  </Card>
+  <Card title="Benchmarking" icon="gauge-high" href="/guides/benchmarking">
+    Measure throughput and latency with the included scripts
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

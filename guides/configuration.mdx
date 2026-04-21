@@ -1,0 +1,139 @@
+---
+title: "Configure the engine, sampling, and KV cache"
+description: "Reference for every EngineConfig and SamplingConfig field, with examples for tuning the scheduler, KV cache budget, and chunked prefill."
+---
+
+All engine behavior is controlled by two frozen dataclasses defined in `engine/config.py`: `EngineConfig` and `SamplingConfig`. Pass an `EngineConfig` instance when constructing `LLMEngine` to control the scheduler, KV cache budget, and sampling defaults.
+
+## Full configuration example
+
+```python
+from engine import EngineConfig, LLMEngine, SamplingConfig, GemmaRuntime, get_device
+
+runtime = GemmaRuntime(
+    choose_model="270m",
+    use_instruct_model=True,
+    device=get_device(),
+)
+
+engine = LLMEngine(
+    runtime=runtime,
+    config=EngineConfig(
+        choose_model="270m",
+        use_instruct_model=True,
+        max_new_tokens=180,
+        max_kv_cache_tokens=32_768,
+        kv_block_size=16,
+        prefill_chunk_size=64,
+        sampling=SamplingConfig(
+            temperature=0.8,
+            top_p=0.9,
+            top_k=50,
+            repetition_penalty=1.1,
+        ),
+    ),
+)
+```
+
+<AccordionGroup>
+  <Accordion title="Engine configuration">
+    `EngineConfig` controls model selection, the scheduler loop, and the KV cache.
+
+    ```python
+    @dataclass(frozen=True)
+    class EngineConfig:
+        choose_model: str = "270m"
+        use_instruct_model: bool = True
+        max_new_tokens: int = 180
+        num_prefill_workers: int = 1
+        num_decode_workers: int = 1
+        max_decode_batch_size: int = 4
+        decode_selection_window: int = 8
+        max_kv_cache_tokens: int = 32_768
+        kv_block_size: int = 16
+        num_kv_blocks: Optional[int] = None
+        prefill_chunk_size: Optional[int] = None
+        sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    ```
+
+    | Field | Default | Description |
+    |---|---|---|
+    | `choose_model` | `"270m"` | Model size selector. Only `"270m"` is currently supported. |
+    | `use_instruct_model` | `True` | When `True`, loads `gemma-3-270m-it` and applies the chat template to every prompt. |
+    | `max_new_tokens` | `180` | Default maximum generated tokens per request. Individual requests can override this value. |
+    | `num_prefill_workers` | `1` | Number of prefill workers. Must be `1` for single-device mode. |
+    | `num_decode_workers` | `1` | Number of decode workers. Must be `1` for single-device mode. |
+    | `max_decode_batch_size` | `4` | Maximum number of requests to decode in a single batched forward pass. |
+    | `decode_selection_window` | `8` | How many requests the scheduler inspects when selecting the next decode cohort. Must be >= `max_decode_batch_size`. |
+    | `max_kv_cache_tokens` | `32_768` | Total KV token budget available to the engine. See the KV cache section below. |
+    | `kv_block_size` | `16` | Number of tokens per KV allocation block. |
+    | `num_kv_blocks` | `None` | Explicit block count. When `None`, derived as `max_kv_cache_tokens // kv_block_size`. |
+    | `prefill_chunk_size` | `None` | When set, splits long prompts into chunks of this size during prefill. When `None`, the entire prompt is processed in a single step. |
+    | `sampling` | `SamplingConfig()` | Default sampling parameters applied to all requests that do not supply their own `SamplingConfig`. |
+  </Accordion>
+
+  <Accordion title="Sampling configuration">
+    `SamplingConfig` controls how the model selects the next token at each decode step.
+
+    ```python
+    @dataclass(frozen=True)
+    class SamplingConfig:
+        temperature: float = 0.8
+        top_p: float = 0.9
+        top_k: int = 50
+        repetition_penalty: float = 1.1
+    ```
+
+    | Field | Default | Description |
+    |---|---|---|
+    | `temperature` | `0.8` | Scales logits before sampling. Values below `1.0` sharpen the distribution; values above `1.0` flatten it. Set to `0.0` for greedy (argmax) decoding. |
+    | `top_p` | `0.9` | Nucleus sampling. Only tokens whose cumulative probability is within the top `top_p` fraction are considered. |
+    | `top_k` | `50` | Restricts the candidate set to the top-k tokens by probability before nucleus sampling is applied. Set to `0` to disable. |
+    | `repetition_penalty` | `1.1` | Divides positive logits and multiplies negative logits for tokens already seen in the generation. Values above `1.0` discourage repetition; exactly `1.0` has no effect. |
+
+    To use greedy decoding (deterministic output, useful for benchmarking):
+
+    ```python
+    SamplingConfig(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        repetition_penalty=1.0,
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="KV cache configuration">
+    The engine allocates KV memory in fixed-size blocks rather than reserving a per-request budget up front. This follows the vLLM-style approach: admit requests cheaply, grow cache usage incrementally, and free blocks immediately when a request finishes.
+
+    Three fields work together to define the KV cache:
+
+    | Field | Default | Role |
+    |---|---|---|
+    | `max_kv_cache_tokens` | `32_768` | Total token capacity across all blocks. |
+    | `kv_block_size` | `16` | Tokens per block. Smaller values increase allocation granularity. |
+    | `num_kv_blocks` | `None` | Explicit block count. When `None`, computed as `max_kv_cache_tokens // kv_block_size`. |
+
+    **Derived block count example:**
+
+    With the defaults, the engine creates `32_768 // 16 = 2_048` blocks. Each block holds KV state for 16 tokens. A request generating 180 tokens requires `ceil(180 / 16) = 12` blocks, leaving 2,036 blocks free for other requests.
+
+    **Override block count explicitly:**
+
+    ```python
+    EngineConfig(
+        max_kv_cache_tokens=32_768,
+        kv_block_size=16,
+        num_kv_blocks=1024,  # use only 1024 blocks regardless of max_kv_cache_tokens
+    )
+    ```
+
+    When `num_kv_blocks` is set, it takes precedence over the derived value. The engine uses exactly that many blocks, which may be fewer than `max_kv_cache_tokens // kv_block_size` allows.
+
+    If a request cannot be allocated enough blocks, the scheduler finishes it with `stop_reason="capacity_exceeded"`.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+Set `prefill_chunk_size` when you expect long prompts. Without chunking, the engine processes the entire prompt in a single forward pass, which can block the decode queue for all other active requests. For example, with `prefill_chunk_size=64`, a 640-token prompt is split into 10 forward passes of 64 tokens each, allowing the scheduler to interleave decode steps for other requests between chunks. Start with a value equal to your `kv_block_size` or a small multiple of it and tune from there based on observed latency.
+</Tip>

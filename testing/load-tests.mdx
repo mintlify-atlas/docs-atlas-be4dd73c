@@ -1,0 +1,103 @@
+---
+title: "Real engine regression and load tests"
+description: "Opt-in tests that load real Gemma weights, verify output consistency across batch sizes, and assert throughput and latency thresholds under concurrency sweep."
+---
+
+The regression and load tests go beyond stubs and mocks: they load real model weights, run the `GemmaRuntime` and `LLMEngine` against the actual `gemma-3-270m-it` checkpoint, and assert properties of real generated output. These tests are deliberately opt-in — they are skipped by default so that the fast unit suite can always run in CI without GPU access or HuggingFace credentials.
+
+<Warning>
+  These tests require the `gemma-3-270m-it` checkpoint to be present locally in `gemma-3-270m-it/` (with `model.safetensors` and `tokenizer.json`). You must have approved access to the Gemma model family on HuggingFace before downloading. The tests also require `torch`, `safetensors`, and `tokenizers` to be installed. If any of these preconditions are unmet, `real_engine_skip_reason()` in `tests/real_engine_test_utils.py` returns a descriptive skip message and the tests are skipped automatically.
+</Warning>
+
+<Note>
+  Real engine tests are significantly slower than unit tests. The regression suite performs multiple full `generate_many` calls with up to 12 new tokens per request. The load suite sweeps concurrency levels of 8, 16, and 32 requests with up to 24 new tokens each. Expect the full load suite to take several minutes even on GPU.
+</Note>
+
+## Regression tests
+
+Regression tests verify that the engine produces deterministic, consistent output across different configurations — batch sizes, decode window sizes, and streaming vs. non-streaming paths.
+
+<Steps>
+  <Step title="Set the opt-in environment variable">
+    Export `RUN_REAL_ENGINE_TESTS=1` to enable real-engine tests. Without this flag the entire suite is skipped.
+
+    ```bash
+    export RUN_REAL_ENGINE_TESTS=1
+    ```
+  </Step>
+  <Step title="Run the regression suite">
+    ```bash
+    RUN_REAL_ENGINE_TESTS=1 python -m unittest -q tests/test_llmengine_regression_real.py
+    ```
+  </Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="LLMEngineRealRegressionTests — all test cases">
+    | Test method | What it verifies |
+    |---|---|
+    | `test_batch_and_single_request_consistency` | Runs the same 4 prompts once as a batch and once individually, then asserts that `token_ids`, `text`, and `stop_reason` are identical for every prompt in both paths. |
+    | `test_decode_batch_size_invariance` | Runs the same prompts with `max_decode_batch_size=4` and `max_decode_batch_size=1` and confirms all token sequences and stop reasons match, with no errors in either engine. |
+    | `test_stream_matches_non_stream` | Generates a single response via `generate_many` and via `generate_stream`, then asserts that the concatenated streamed text equals `result.text` from the non-streaming call. |
+    | `test_zero_max_new_tokens` | Calls `generate_many` with `max_new_tokens=0` and asserts `stop_reason="max_new_tokens"`, empty `token_ids`, and empty `text` on the real model. |
+    | `test_context_limit_stop_reason` | Constructs a prompt that exceeds `model.context_length` tokens, then confirms the result has `stop_reason="context_limit"`, zero `token_ids`, and zero `decode_steps`. |
+    | `test_result_metrics_sanity` | Runs 4 prompts and asserts that all timing fields (`queue_wait_s`, `prefill_s`, `decode_s`, `total_latency_s`, `model_tokens_per_s`) are non-negative and that `decode_steps == len(token_ids)`. |
+  </Accordion>
+</AccordionGroup>
+
+## Load tests
+
+Load tests sweep the engine across multiple concurrency levels and assert that error rate, p95 total latency, and throughput stay within configured thresholds.
+
+<Steps>
+  <Step title="Set both opt-in environment variables">
+    Load tests require both `RUN_REAL_ENGINE_TESTS=1` and `RUN_REAL_ENGINE_LOAD_TESTS=1`.
+
+    ```bash
+    export RUN_REAL_ENGINE_TESTS=1
+    export RUN_REAL_ENGINE_LOAD_TESTS=1
+    ```
+  </Step>
+  <Step title="Run the load suite">
+    ```bash
+    RUN_REAL_ENGINE_TESTS=1 RUN_REAL_ENGINE_LOAD_TESTS=1 python -m unittest -q tests/test_llmengine_load_real.py
+    ```
+  </Step>
+  <Step title="Override thresholds (optional)">
+    You can override any threshold using environment variables before running:
+
+    ```bash
+    LOAD_MAX_ERROR_RATE=0.05 \
+    LOAD_MAX_P95_TOTAL_S=30.0 \
+    LOAD_MIN_THROUGHPUT_TPS=2.0 \
+    RUN_REAL_ENGINE_TESTS=1 RUN_REAL_ENGINE_LOAD_TESTS=1 \
+    python -m unittest -q tests/test_llmengine_load_real.py
+    ```
+  </Step>
+</Steps>
+
+### Load threshold environment variables
+
+Thresholds are read from `tests/baselines/llmengine_load_thresholds.json` and can be overridden per-run with environment variables.
+
+| Variable | Default source | Description |
+|---|---|---|
+| `LOAD_MAX_ERROR_RATE` | `llmengine_load_thresholds.json` | Maximum fraction of requests that may return a non-`None` `error_message`. |
+| `LOAD_MAX_P95_TOTAL_S` | `llmengine_load_thresholds.json` | Maximum allowed p95 total latency in seconds across all requests in a concurrency sweep. |
+| `LOAD_MIN_THROUGHPUT_TPS` | `llmengine_load_thresholds.json` | Minimum required tokens per second across the full batch. |
+
+<AccordionGroup>
+  <Accordion title="LLMEngineRealLoadTests — all test cases">
+    | Test method | What it verifies |
+    |---|---|
+    | `test_concurrency_sweep_stability` | Runs three concurrency levels (8, 16, and 32 requests) using prompts drawn from a 10-item prompt bank. For each level it asserts that `error_rate <= max_error_rate`, `p95_total_latency_s <= max_p95_total_s`, and `throughput_tps >= min_throughput_tps`. Prints a JSON summary including per-level concurrency, request count, errors, total tokens, elapsed time, throughput, average latency, and p95 latency. |
+  </Accordion>
+</AccordionGroup>
+
+## Shared utilities in `real_engine_test_utils.py`
+
+Both test files rely on helpers in `tests/real_engine_test_utils.py`:
+
+- **`real_engine_skip_reason(load_test=False)`** — returns a human-readable skip reason string if `RUN_REAL_ENGINE_TESTS` is unset, the `gemma-3-270m-it/` directory is missing `model.safetensors` or `tokenizer.json`, or any of `torch`, `safetensors`, `tokenizers` are unavailable. Returns an empty string when all preconditions are met.
+- **`get_shared_runtime()`** — builds a `GemmaRuntime` once and caches it with `@lru_cache(maxsize=1)` so the model is loaded only once per process, even when multiple test classes share it.
+- **`build_engine(max_new_tokens, max_decode_batch_size)`** — constructs an `LLMEngine` from the cached runtime using greedy sampling (`temperature=0.0`, `repetition_penalty=1.0`) and the provided generation limits.

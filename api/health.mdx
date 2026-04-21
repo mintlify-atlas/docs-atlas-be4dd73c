@@ -1,0 +1,109 @@
+---
+title: "GET /healthz and GET /readyz probes reference"
+description: "GET /healthz returns 200 while the process runs; GET /readyz returns 200 only after the model loads. Use readyz to gate completion requests at startup."
+---
+
+The server exposes two health probes that serve distinct purposes. The liveness probe (`/healthz`) tells you whether the server process is running. The readiness probe (`/readyz`) tells you whether the model has successfully loaded and the server is ready to accept completion requests. Use them together to manage startup sequencing and monitor the process in production.
+
+## GET /healthz
+
+A lightweight liveness probe. The server returns `200 OK` with a fixed JSON body as long as the FastAPI process is running, regardless of whether the model has loaded.
+
+```
+GET /healthz
+```
+
+### Response
+
+**200 OK** — server process is running.
+
+<ResponseField name="status" type="string">
+  Always `"ok"`.
+</ResponseField>
+
+```json
+{"status": "ok"}
+```
+
+### curl example
+
+```bash
+curl -s http://localhost:8000/healthz
+```
+
+Expected output:
+
+```json
+{"status": "ok"}
+```
+
+---
+
+## GET /readyz
+
+A readiness probe. The server returns `200 OK` only after `ChatCompletionService` has been constructed successfully during startup. If the service is still loading or failed to load, the server returns `503 Service Unavailable`.
+
+```
+GET /readyz
+```
+
+### Response
+
+**200 OK** — model loaded and ready to serve requests.
+
+<ResponseField name="status" type="string">
+  Always `"ready"` when the response is `200`.
+</ResponseField>
+
+```json
+{"status": "ready"}
+```
+
+**503 Service Unavailable** — model not yet loaded or startup failed.
+
+<ResponseField name="detail" type="string">
+  Human-readable explanation. `"service unavailable: startup incomplete"` while loading; a descriptive error message if model load raised an exception (e.g. missing weights, out-of-memory).
+</ResponseField>
+
+```json
+{"detail": "service unavailable: startup incomplete"}
+```
+
+If the model load fails, the `detail` field includes the underlying exception message:
+
+```json
+{"detail": "service unavailable: [Errno 2] No such file or directory: 'gemma-3-270m-it/config.json'"}
+```
+
+### curl example
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/readyz
+```
+
+Full response body:
+
+```bash
+curl -s http://localhost:8000/readyz
+```
+
+---
+
+## When to use each probe
+
+| Probe | Use case |
+|-------|----------|
+| `/healthz` | Process-level health checks. Use to detect crashes and trigger a restart. |
+| `/readyz` | Traffic routing and startup gates. Do not send completion requests until this returns `200`. |
+
+<Tip>
+  Poll `/readyz` in a loop before sending your first `/v1/chat/completions` request. The model load can take several seconds. A simple shell loop works well during development:
+
+  ```bash
+  until curl -sf http://localhost:8000/readyz > /dev/null; do
+    echo "Waiting for model to load..."
+    sleep 2
+  done
+  echo "Server ready."
+  ```
+</Tip>

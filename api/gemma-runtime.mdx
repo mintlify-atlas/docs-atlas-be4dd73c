@@ -1,0 +1,140 @@
+---
+title: "GemmaRuntime: model loading and tokenization"
+description: "Load Gemma 3 270m weights from HuggingFace or a local cache, resolve the tokenizer, and expose the model and device needed by LLMEngine."
+---
+
+`GemmaRuntime` is responsible for bootstrapping everything the inference engine needs to run: building the `Gemma3Model` architecture, downloading (or loading from cache) the safetensor weights, applying those weights to the model, and resolving the `GemmaTokenizer`. Once constructed, a runtime instance exposes `runtime.model`, `runtime.tokenizer`, and `runtime.device` as stable attributes. You pass the runtime directly to `LLMEngine`, which reads from it throughout the request lifecycle.
+
+## Constructor
+
+```python
+GemmaRuntime(
+    choose_model: str = "270m",
+    use_instruct_model: bool = True,
+    device: Optional[torch.device] = None,
+)
+```
+
+<ParamField path="choose_model" type="str" default="270m">
+  Model size selector. Only `"270m"` is currently supported. Passing any other value raises `ValueError` immediately.
+</ParamField>
+
+<ParamField path="use_instruct_model" type="bool" default="True">
+  When `True`, loads the instruction-tuned checkpoint `google/gemma-3-270m-it` and the engine will apply the Gemma chat template to every prompt. When `False`, loads the base checkpoint `google/gemma-3-270m` and prompts are tokenized as-is.
+</ParamField>
+
+<ParamField path="device" type="Optional[torch.device]" default="None">
+  Target device for the model and KV cache tensors. When `None`, the device is auto-detected in priority order: CUDA → MPS → CPU. Pass an explicit `torch.device` to override this, for example `torch.device("cpu")` for testing.
+</ParamField>
+
+---
+
+## What happens on init
+
+When you call `GemmaRuntime(...)`, the following steps run in sequence:
+
+1. **Device resolution** — `get_device()` checks `torch.cuda.is_available()`, then `torch.backends.mps.is_available()`, and falls back to CPU.
+2. **Model construction** — `build_gemma3_270m()` instantiates `Gemma3Model` using `GEMMA3_CONFIG_270M` and moves it to the resolved device.
+3. **Weight download or cache load** — `download_weights` looks for `model.safetensors` in a local directory named after the HuggingFace repo (e.g. `gemma-3-270m-it/`). If the file exists it is loaded directly; otherwise `hf_hub_download` fetches it from HuggingFace and saves it to that directory.
+4. **Weight loading** — `load_weights_into_gemma` maps the downloaded tensors into the model parameters.
+5. **Tokenizer resolution** — `resolve_tokenizer_path` looks for `tokenizer.json` in the same local directory, then falls back to a root-level `tokenizer.json`, and finally downloads from HuggingFace if neither is found.
+6. **Eval mode** — `model.eval()` is called so dropout and batch-norm layers behave deterministically during inference.
+
+---
+
+## Local caching
+
+The runtime derives its local directory name from the HuggingFace repo ID:
+
+| `use_instruct_model` | Repo ID | Local directory |
+|---|---|---|
+| `True` | `google/gemma-3-270m-it` | `gemma-3-270m-it/` |
+| `False` | `google/gemma-3-270m` | `gemma-3-270m/` |
+
+On the first run, `model.safetensors` and `tokenizer.json` are downloaded into this directory relative to your working directory. On subsequent runs, the local files are used and no network request is made.
+
+<Tip>
+  Place pre-downloaded weights at `gemma-3-270m-it/model.safetensors` (or `gemma-3-270m/model.safetensors` for the base model) to skip the HuggingFace download entirely. Copy `tokenizer.json` into the same directory. This is useful in air-gapped environments or when you want to pin a specific checkpoint.
+</Tip>
+
+<Note>
+  The first download requires a HuggingFace account with access to the Gemma 3 model repository. Make sure you have accepted the model license on HuggingFace and that your environment is authenticated (e.g. via `huggingface-cli login` or the `HF_TOKEN` environment variable) before constructing `GemmaRuntime`.
+</Note>
+
+---
+
+## Key attributes
+
+After construction, the following attributes are available:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `runtime.model` | `Gemma3Model` | The loaded model in eval mode, already on the target device. |
+| `runtime.tokenizer` | `GemmaTokenizer` | Wraps a `tokenizers.Tokenizer` loaded from `tokenizer.json`. |
+| `runtime.device` | `torch.device` | The device all tensors are placed on. |
+| `runtime.repo_id` | `str` | The HuggingFace repo ID used for downloads. |
+| `runtime.local_dir` | `str` | Local directory used for caching weights and tokenizer. |
+
+---
+
+## Tokenizer
+
+`GemmaTokenizer` wraps `tokenizers.Tokenizer` from the HuggingFace `tokenizers` library. It uses the `<end_of_turn>` token as both the EOS token and the pad token:
+
+```python
+self.eos_token_id  = self._tok.encode("<end_of_turn>").ids[-1]
+self.pad_token_id  = self.eos_token_id
+```
+
+The two public methods are:
+
+- **`encode(text: str) -> list[int]`** — tokenizes a string and returns a list of integer IDs.
+- **`decode(ids: list[int]) -> str`** — converts a list of IDs back to a string. Special tokens are not skipped, so the EOS token appears as `<end_of_turn>` in the raw output. `LLMEngine` strips the trailing EOS token before populating `GenerationResult.text`.
+
+---
+
+## Chat template
+
+When `use_instruct_model=True`, `LLMEngine` calls `apply_chat_template` before tokenizing each prompt:
+
+```python
+def apply_chat_template(user_text: str) -> str:
+    return f"<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
+```
+
+This wraps your input in the turn-delimited format that the instruction-tuned model was trained on. You do not need to call this yourself; the engine applies it automatically.
+
+---
+
+## Model architecture: `build_gemma3_270m`
+
+`build_gemma3_270m()` constructs a `Gemma3Model` using `GEMMA3_CONFIG_270M`:
+
+```python
+def build_gemma3_270m() -> Gemma3Model:
+    return Gemma3Model(GEMMA3_CONFIG_270M)
+```
+
+The config defines an 18-layer transformer with alternating sliding-window and full-attention layers:
+
+<Expandable title="GEMMA3_CONFIG_270M fields">
+
+| Field | Value |
+|---|---|
+| `vocab_size` | 262 144 |
+| `context_length` | 32 768 |
+| `emb_dim` | 640 |
+| `n_heads` | 4 |
+| `n_layers` | 18 |
+| `hidden_dim` | 2048 |
+| `head_dim` | 256 |
+| `n_kv_groups` | 1 |
+| `qk_norm` | `True` |
+| `sliding_window` | 512 |
+| `rope_local_base` | 10 000.0 |
+| `rope_base` | 1 000 000.0 |
+| `dtype` | `torch.bfloat16` |
+| `query_pre_attn_scalar` | 256 |
+| `layer_types` | 15 sliding-attention + 3 full-attention (at positions 5, 11, 17 zero-indexed) |
+
+</Expandable>

@@ -1,0 +1,58 @@
+---
+title: "HTTP API overview: OpenAI-compatible chat endpoint"
+description: "The Gemma 3 inference server exposes three HTTP endpoints — chat completions, liveness, and readiness — compatible with the OpenAI client libraries."
+---
+
+The Gemma 3 inference engine exposes a local HTTP API that mirrors the OpenAI chat completions interface. Because the API is wire-compatible with OpenAI's specification, you can point any OpenAI client library at `http://localhost:8000/v1` and interact with the local Gemma model without changing your application code.
+
+## Available endpoints
+
+The server exposes three routes:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/chat/completions` | Generate a chat completion (streaming or non-streaming) |
+| `GET` | `/healthz` | Liveness probe — confirms the server process is running |
+| `GET` | `/readyz` | Readiness probe — confirms the model has finished loading |
+
+## Authentication
+
+No authentication is required. The server is designed for local use and does not validate API keys. When using the OpenAI Python SDK, pass any non-empty string for `api_key`.
+
+## Starting the server
+
+```bash
+python -m openai_api.run
+```
+
+The server binds to `http://localhost:8000` by default. Model weights are downloaded or loaded from disk during startup; the `/readyz` endpoint returns `200` once the model is ready to serve requests.
+
+## Example: OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+
+print(response.choices[0].message.content)
+```
+
+<Note>
+  The only accepted value for `model` is `"gemma-3-270m-it"`. Passing any other model name returns a validation error.
+</Note>
+
+## Explore the API
+
+<CardGroup cols={2}>
+  <Card title="POST /v1/chat/completions" icon="message" href="/api/chat-completions">
+    Full request and response reference, including streaming, all parameters, and error codes.
+  </Card>
+  <Card title="GET /healthz and GET /readyz" icon="heart-pulse" href="/api/health">
+    Liveness and readiness probe reference with curl examples and polling guidance.
+  </Card>
+</CardGroup>

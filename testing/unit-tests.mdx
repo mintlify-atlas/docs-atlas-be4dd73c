@@ -1,0 +1,89 @@
+---
+title: "Run and understand the unit test suite"
+description: "Learn what the scheduler and API unit tests cover, how to run them, and what each test case verifies — no Gemma model weights required to run."
+---
+
+The unit test suite validates two distinct layers of the Gemma 3 Inference Engine: scheduler correctness (round-robin decode ordering, paged KV cache isolation between requests, block-capacity reuse and deferral) and OpenAI-compatible API response shapes. All tests run against fakes and stubs, so you can execute the full suite on any machine without downloading model weights.
+
+<Note>
+  Unit tests do not require model weights. `tests/test_round_robin.py` uses `FakeRuntime`, `FakePagedModel`, and `FakeTokenizer` stubs. `tests/test_openai_chat_api.py` uses `FakeChatService` and FastAPI's `TestClient`. Neither file loads or downloads any Gemma checkpoint.
+</Note>
+
+## How to run the unit tests
+
+<Steps>
+  <Step title="Install dependencies">
+    Install the required packages. FastAPI and its test client are needed for the API tests; the scheduler tests only need `torch`.
+
+    ```bash
+    python -m pip install torch tokenizers safetensors huggingface_hub fastapi uvicorn pydantic starlette
+    ```
+  </Step>
+  <Step title="Run the full suite">
+    From the project root, run all tests under `tests/` in quiet mode:
+
+    ```bash
+    python -m unittest discover -s tests -q
+    ```
+  </Step>
+  <Step title="Run a single test file">
+    To run only the scheduler tests or only the API tests:
+
+    ```bash
+    python -m unittest tests.test_round_robin -q
+    python -m unittest tests.test_openai_chat_api -q
+    ```
+  </Step>
+</Steps>
+
+## Test file breakdown
+
+### `tests/test_round_robin.py`
+
+This file covers the `LLMEngine` scheduler in isolation. It exercises round-robin decode ordering across multiple concurrent requests, paged KV cache isolation so one request cannot read another request's cached key/value state, and block-capacity reuse and deferral when the total KV token budget is constrained.
+
+The test class is `RoundRobinSchedulerTests`. A `FakeRuntime` provides a `FakePagedModel` that writes token values directly into the paged KV blocks and raises an error if it detects cross-request cache leakage.
+
+<AccordionGroup>
+  <Accordion title="RoundRobinSchedulerTests — all test cases">
+    | Test method | What it verifies |
+    |---|---|
+    | `test_round_robin_token_order` | Confirms that three concurrent requests are decoded in round-robin order and produce the expected token sequences and stop reasons. |
+    | `test_error_isolation` | Verifies that a model error on one request (forced via `fail_on_token=2`) marks only that request as `"error"` while the other two complete normally with `"max_new_tokens"`. |
+    | `test_kv_cache_isolation_between_requests` | Runs three requests with tokens `100`, `200`, `300` to confirm that paged KV blocks are never shared or leaked across requests. |
+    | `test_zero_max_new_tokens_respected` | Passes `max_new_tokens=0` and asserts the result has `stop_reason="max_new_tokens"`, an empty `token_ids` list, and an empty `text` string. |
+    | `test_capacity_exceeded_rejects_request` | Configures the engine with `num_kv_blocks=1` so capacity is exhausted after prefill, then confirms the result carries `stop_reason="capacity_exceeded"` and the error message contains `"KV cache capacity exceeded"`. |
+    | `test_capacity_released_after_finished_request` | Runs two sequential single-request batches with a tight KV budget and asserts that after both finish `engine.capacity.reserved_tokens` returns to zero. |
+    | `test_capacity_defers_later_request_until_budget_frees` | Runs two requests concurrently against a 3-token KV budget and confirms both complete with `"max_new_tokens"` once the first request frees its blocks. |
+    | `test_chunked_prefill_splits_prompt_into_multiple_steps` | Feeds a 4-token prompt with `prefill_chunk_size=2` and asserts `request.prefill_steps == 2`, the correct first generated token, and that both model forward calls use sequence length 2. |
+    | `test_chunked_prefill_allows_decode_between_prompt_chunks` | Interleaves a 3-chunk prefill with a 1-chunk prefill and one decode step to confirm the scheduler correctly interleaves prefill and decode phases. Checks `call_last_tokens[:5] == [1, 7, 2, 17, 3]`. |
+    | `test_select_decode_batch_prefers_fuller_compatible_cohort` | Asserts that `_select_decode_batch` picks requests 2 and 3 (both `token_length=7`) over requests with `token_length=5` or `token_length=9`. |
+    | `test_select_decode_batch_tie_breaks_to_older_group` | When two groups of equal size are tied, confirms the scheduler picks the earlier-arriving group (requests 1 and 2). |
+    | `test_select_decode_batch_respects_window_limit` | With 6 queued requests and `decode_selection_window=4`, confirms only the first 4 are considered and the correct pair is selected. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### `tests/test_openai_chat_api.py`
+
+This file tests the FastAPI application layer using `FakeChatService` in place of a real `ChatCompletionService`. It covers non-streaming and streaming response shapes, model validation, readiness probe behavior, and fast-fail behavior when service startup fails.
+
+The file skips automatically when `fastapi` is not installed (`@unittest.skipUnless(FASTAPI_AVAILABLE, ...)`).
+
+<AccordionGroup>
+  <Accordion title="OpenAIChatAPITests — happy-path cases">
+    | Test method | What it verifies |
+    |---|---|
+    | `test_non_stream_response_shape` | POSTs to `/v1/chat/completions` with `stream=False` and confirms HTTP 200, `object == "chat.completion"`, `choices[0].message.role == "assistant"`, and a `usage` field. |
+    | `test_stream_response_has_done` | POSTs with `stream=True` and confirms HTTP 200 with `"data: [DONE]"` present in the SSE body. |
+    | `test_rejects_unknown_model` | POSTs with `model="gpt-4o-mini"` and expects HTTP 422. |
+    | `test_readyz_reports_ready_after_startup` | GETs `/readyz` after a successful startup and expects `{"status": "ready"}` with HTTP 200. |
+  </Accordion>
+  <Accordion title="OpenAIChatAPIStartupFailureTests — failure-mode cases">
+    | Test method | What it verifies |
+    |---|---|
+    | `test_readyz_reports_startup_failure` | Creates the app with a `failing_service_factory` that raises `RuntimeError("model init failed")`, then confirms `/readyz` returns HTTP 503 with `detail == "service unavailable: model init failed"`. |
+    | `test_chat_completion_fails_fast_when_service_unavailable` | With the same failing factory, confirms that `POST /v1/chat/completions` also returns HTTP 503 with the same detail message rather than hanging or returning a 500. |
+  </Accordion>
+</AccordionGroup>

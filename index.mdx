@@ -1,97 +1,64 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Gemma 3 Inference Engine: Minimal vLLM-style LLM inference"
+description: "A clean PyTorch implementation of Gemma-3-style inference with paged KV cache, multi-request scheduling, and an OpenAI-compatible chat API."
 ---
 
-## Setting up
+Gemma 3 Inference Engine is a minimal, readable PyTorch implementation of LLM inference modeled after vLLM's core ideas. It runs the Gemma-3-270M model with a block-based paged KV cache, a continuous batching scheduler, and an OpenAI-compatible REST API — all in a codebase designed to be read and extended.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies and run your first inference in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the model, engine, and API layers
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Server" icon="server" href="/guides/api-server">
+    Serve the OpenAI-compatible chat completions endpoint
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for the HTTP and Python APIs
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What's inside
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Paged KV Cache" icon="memory" href="/concepts/paged-kv-cache">
+    Block-based KV allocation that admits requests cheaply and frees memory immediately on completion
+  </Card>
+  <Card title="Scheduler" icon="list-check" href="/concepts/scheduler">
+    Continuous prefill/decode scheduling with round-robin batching across concurrent requests
+  </Card>
+  <Card title="Direct inference" icon="terminal" href="/guides/direct-inference">
+    Run generation locally without the API server using `python main.py`
+  </Card>
+  <Card title="Benchmarking" icon="gauge-high" href="/guides/benchmarking">
+    Measure throughput and latency with the included benchmark scripts
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started in three steps
 
-## Need inspiration?
+<Steps>
+  <Step title="Install dependencies">
+    ```bash
+    python -m pip install torch tokenizers safetensors huggingface_hub fastapi uvicorn pydantic starlette
+    ```
+  </Step>
+  <Step title="Start the API server">
+    ```bash
+    python -m openai_api.run
+    ```
+    The server loads the Gemma-3-270M weights on startup and exposes `POST /v1/chat/completions` on port 8000.
+  </Step>
+  <Step title="Send a chat request">
+    ```bash
+    python query_fastapi.py --stream --prompt "Give me one short line about LLM inference."
+    ```
+    Or use any OpenAI-compatible client pointed at `http://localhost:8000`.
+  </Step>
+</Steps>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+  You need approved access to the Gemma checkpoints on Hugging Face before the first download. See [Quickstart](/quickstart) for details.
+</Note>

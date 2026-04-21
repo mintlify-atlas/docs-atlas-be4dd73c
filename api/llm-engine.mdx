@@ -1,0 +1,271 @@
+---
+title: "LLMEngine: multi-request generation scheduler"
+description: "Run prefill and decode phases across multiple concurrent requests on a single device using a round-robin cohort scheduler backed by paged KV cache management."
+---
+
+`LLMEngine` is the central scheduler for the Gemma 3 inference engine. It operates in two explicit phases: a **prefill phase** that processes a full prompt (or a chunk of it) in a single forward pass, and a **decode phase** that generates tokens one step at a time using round-robin batching over active requests. All state is tracked per request via `RequestState`, and memory is managed through a block-based KV cache allocator (`KVBlockManager`). You pass a fully initialized `GemmaRuntime` and an `EngineConfig` at construction time; the engine then owns those resources for its lifetime.
+
+## Instantiation
+
+`LLMEngine` requires a `GemmaRuntime` (which holds the loaded model and tokenizer) and an `EngineConfig` (which controls scheduling, memory, and sampling defaults).
+
+```python
+from engine.runtime import GemmaRuntime
+from engine.config import EngineConfig
+from engine.scheduler import LLMEngine
+
+runtime = GemmaRuntime(choose_model="270m", use_instruct_model=True)
+config = EngineConfig()
+engine = LLMEngine(runtime=runtime, config=config)
+```
+
+On construction the engine allocates paged KV cache tensors on the target device via `model.init_paged_kv_caches`. These tensors persist for the lifetime of the engine and are reused across all requests.
+
+<Note>
+`num_prefill_workers` and `num_decode_workers` in `EngineConfig` must both be `1`. The engine is designed for single-device execution and raises `ValueError` at runtime if either value differs from `1`.
+</Note>
+
+---
+
+## Methods
+
+### `generate`
+
+Runs a single prompt through the full prefill-decode pipeline and returns the completed text as a string. Internally calls `generate_many` with a one-element list and raises `RuntimeError` if the request finishes with an error.
+
+**Signature**
+
+```python
+generate(
+    prompt: str,
+    *,
+    sampling: Optional[SamplingConfig] = None,
+    max_new_tokens: Optional[int] = None,
+) -> str
+```
+
+<ParamField path="prompt" type="str" required>
+  The input text to generate a completion for. When `use_instruct_model=True` in your config, the engine automatically wraps this in the Gemma chat template before tokenization.
+</ParamField>
+
+<ParamField path="sampling" type="Optional[SamplingConfig]">
+  Per-call sampling override. When `None`, the engine uses the `sampling` field from `EngineConfig`.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="Optional[int]">
+  Maximum number of tokens to generate for this call. When `None`, falls back to `EngineConfig.max_new_tokens`.
+</ParamField>
+
+**Example**
+
+```python
+text = engine.generate("Explain the attention mechanism in transformers.")
+print(text)
+```
+
+---
+
+### `generate_many`
+
+Processes a list of prompts concurrently using the prefill/decode scheduler and returns one `GenerationResult` per prompt in the same order as the input list.
+
+**Signature**
+
+```python
+generate_many(
+    prompts: List[str],
+    *,
+    sampling: Optional[SamplingConfig] = None,
+    max_new_tokens: Optional[int] = None,
+) -> List[GenerationResult]
+```
+
+<ParamField path="prompts" type="List[str]" required>
+  One or more input texts. An empty list returns immediately with `[]`.
+</ParamField>
+
+<ParamField path="sampling" type="Optional[SamplingConfig]">
+  Sampling config applied to every request in this batch. Overrides the engine-level default when set.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="Optional[int]">
+  Token generation limit applied to every request in this batch.
+</ParamField>
+
+**Example**
+
+```python
+from engine.config import SamplingConfig
+
+results = engine.generate_many(
+    ["What is a transformer?", "Summarize the Gemma paper."],
+    sampling=SamplingConfig(temperature=0.5),
+    max_new_tokens=256,
+)
+for r in results:
+    print(r.request_id, r.stop_reason, r.text)
+```
+
+#### `GenerationResult` fields
+
+Each element returned by `generate_many` is a `GenerationResult` dataclass:
+
+<ResponseField name="request_id" type="int">
+  Zero-based index of the request within the input `prompts` list.
+</ResponseField>
+
+<ResponseField name="text" type="str">
+  Decoded output text. The EOS token is stripped when `stop_reason` is `"eos"`.
+</ResponseField>
+
+<ResponseField name="token_ids" type="List[int]">
+  Raw generated token IDs including the EOS token if one was emitted.
+</ResponseField>
+
+<ResponseField name="stop_reason" type="str">
+  Why generation ended. One of `"eos"`, `"max_new_tokens"`, `"context_limit"`, `"capacity_exceeded"`, or `"error"`.
+</ResponseField>
+
+<ResponseField name="error_message" type="Optional[str]">
+  Set to a non-`None` string when `stop_reason` is `"error"`.
+</ResponseField>
+
+<ResponseField name="queue_wait_s" type="float">
+  Seconds the request spent waiting before its first scheduled step.
+</ResponseField>
+
+<ResponseField name="prefill_s" type="float">
+  Total wall-clock seconds spent in prefill forward passes for this request.
+</ResponseField>
+
+<ResponseField name="decode_s" type="float">
+  Total wall-clock seconds spent in decode forward passes for this request.
+</ResponseField>
+
+<ResponseField name="total_latency_s" type="float">
+  End-to-end wall-clock latency from request creation to completion.
+</ResponseField>
+
+<ResponseField name="model_tokens_per_s" type="float">
+  Generated tokens divided by `prefill_s + decode_s`. Excludes queue wait time.
+</ResponseField>
+
+<ResponseField name="prefill_steps" type="int">
+  Number of prefill forward passes (greater than 1 when `prefill_chunk_size` is set).
+</ResponseField>
+
+<ResponseField name="decode_steps" type="int">
+  Number of decode forward passes (one per generated token).
+</ResponseField>
+
+---
+
+### `generate_stream`
+
+Yields decoded text fragments as they are generated, one token at a time. Use this when you want to stream output to a user without waiting for the full completion.
+
+**Signature**
+
+```python
+generate_stream(
+    prompt: str,
+    *,
+    sampling: Optional[SamplingConfig] = None,
+    max_new_tokens: Optional[int] = None,
+) -> Iterator[str]
+```
+
+<ParamField path="prompt" type="str" required>
+  The input text for which to stream a completion.
+</ParamField>
+
+<ParamField path="sampling" type="Optional[SamplingConfig]">
+  Per-call sampling override.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="Optional[int]">
+  Token generation limit for this call.
+</ParamField>
+
+**Example**
+
+```python
+import sys
+
+for chunk in engine.generate_stream("Write a haiku about inference engines."):
+    sys.stdout.write(chunk)
+    sys.stdout.flush()
+print()
+```
+
+---
+
+### `generate_stream_events`
+
+Like `generate_stream`, but yields `StreamEvent` objects that carry both text fragments and a terminal `"done"` event with stop metadata. Use this when you need structured control over the stream lifecycle.
+
+**Signature**
+
+```python
+generate_stream_events(
+    prompt: str,
+    *,
+    sampling: Optional[SamplingConfig] = None,
+    max_new_tokens: Optional[int] = None,
+) -> Iterator[StreamEvent]
+```
+
+<ParamField path="prompt" type="str" required>
+  The input text to generate a completion for.
+</ParamField>
+
+<ParamField path="sampling" type="Optional[SamplingConfig]">
+  Per-call sampling override.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="Optional[int]">
+  Token generation limit for this call.
+</ParamField>
+
+**Example**
+
+```python
+for event in engine.generate_stream_events("Describe paged KV caching."):
+    if event.kind == "text":
+        print(event.text, end="", flush=True)
+    elif event.kind == "done":
+        print()
+        print(f"Stopped: {event.stop_reason}")
+        if event.error_message:
+            print(f"Error: {event.error_message}")
+```
+
+#### `StreamEvent` fields
+
+<ResponseField name="kind" type="str">
+  Either `"text"` for a token fragment or `"done"` for the terminal event that closes the stream.
+</ResponseField>
+
+<ResponseField name="text" type="str">
+  The decoded text fragment. Non-empty only when `kind` is `"text"`. Defaults to `""`.
+</ResponseField>
+
+<ResponseField name="stop_reason" type="Optional[str]">
+  Set on the `"done"` event. One of `"eos"`, `"max_new_tokens"`, `"context_limit"`, `"capacity_exceeded"`, or `"error"`.
+</ResponseField>
+
+<ResponseField name="error_message" type="Optional[str]">
+  Set on the `"done"` event when `stop_reason` is `"error"`.
+</ResponseField>
+
+---
+
+## Stop reasons
+
+| Value | Meaning |
+|---|---|
+| `"eos"` | The model emitted the end-of-sequence token (`<end_of_turn>`). |
+| `"max_new_tokens"` | The request reached its `max_new_tokens` limit. |
+| `"context_limit"` | The total token count reached the model's context length (32 768 for the 270m model). |
+| `"capacity_exceeded"` | The KV cache block allocator could not satisfy the request's memory requirement. |
+| `"error"` | An unexpected exception occurred during prefill or decode. Check `error_message` for details. |

@@ -1,0 +1,113 @@
+---
+title: "SamplingConfig: control token sampling behavior"
+description: "Tune temperature scaling, nucleus filtering, top-k filtering, and repetition penalty to shape how the model selects each output token during generation."
+---
+
+`SamplingConfig` is a frozen dataclass that controls how the model samples the next token at each decode step. The four parameters interact in a fixed pipeline: temperature scaling narrows or broadens the probability distribution, top-k and top-p filtering remove low-probability candidates, and softmax plus multinomial sampling draws the final token. Repetition penalty is applied before this pipeline to discourage the model from repeating tokens it has already generated. Together these parameters let you trade off between creative, diverse output and focused, deterministic responses.
+
+## Import and instantiation
+
+```python
+from engine.config import SamplingConfig
+
+# Use defaults
+sampling = SamplingConfig()
+
+# Custom values
+sampling = SamplingConfig(temperature=0.3, top_p=0.95, top_k=40, repetition_penalty=1.05)
+```
+
+`SamplingConfig` is frozen, so all fields must be provided at construction time.
+
+---
+
+## Parameters
+
+<ParamField path="temperature" type="float" default="0.8">
+  Scales the logits before sampling: `logits = logits / temperature`. Lower values (closer to 0) make the distribution sharper, favoring the highest-probability token. Higher values flatten the distribution, producing more varied output. Setting `temperature=0` bypasses sampling entirely and uses greedy argmax, returning the single most likely token at every step.
+</ParamField>
+
+<ParamField path="top_p" type="float" default="0.9">
+  Nucleus sampling threshold. After temperature scaling, the vocabulary is sorted by probability and the smallest set of tokens whose cumulative probability exceeds `top_p` is kept; all other tokens are masked to `-inf`. A value of `1.0` disables nucleus filtering. Valid range is `0` to `1`.
+</ParamField>
+
+<ParamField path="top_k" type="int" default="50">
+  Keeps only the `top_k` highest-logit tokens before nucleus filtering. Tokens outside the top-k are masked to `-inf`. Set to `0` to disable top-k filtering.
+</ParamField>
+
+<ParamField path="repetition_penalty" type="float" default="1.1">
+  Penalty multiplier applied to logits for tokens the model has already generated (tracked via `seen_token_ids` in `RequestState`). Values greater than `1.0` discourage repetition: positive logits are divided by the penalty and negative logits are multiplied by it, pushing previously used tokens further from the sampling boundary. A value of `1.0` or less disables the penalty entirely.
+</ParamField>
+
+---
+
+## How sampling works
+
+The `sample_next_token` function in `engine/sampling.py` implements the following pipeline on the final-position logits `logits[:, -1, :]`:
+
+**1. Repetition penalty** (`apply_repetition_penalty_`)
+
+Before entering `sample_next_token`, the scheduler calls `apply_repetition_penalty_` to adjust logits for every token in `seen_token_ids`. For each previously seen token ID at index `i`:
+
+```python
+# Positive logits are divided; negative logits are multiplied
+logits[i] = logits[i] / penalty   # if logits[i] >= 0
+logits[i] = logits[i] * penalty   # if logits[i] < 0
+```
+
+This asymmetric treatment means that both high-scoring and low-scoring tokens that have already appeared are pushed away from the decision boundary, reducing the chance that the model repeats them.
+
+**2. Temperature scaling**
+
+```python
+logits = logits / temperature
+```
+
+Skipped entirely when `temperature <= 0`; greedy argmax is returned immediately.
+
+**3. Top-k filtering**
+
+```python
+kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
+logits = logits.masked_fill(logits < kth, float("-inf"))
+```
+
+Tokens outside the top-k receive `-inf` logits and are excluded from subsequent steps.
+
+**4. Top-p (nucleus) filtering**
+
+```python
+sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+sorted_probs = torch.softmax(sorted_logits, dim=-1)
+cdf = torch.cumsum(sorted_probs, dim=-1)
+# Remove tokens beyond the nucleus
+to_remove[..., 1:] = (cdf > top_p)[..., :-1]
+sorted_logits = sorted_logits.masked_fill(to_remove, float("-inf"))
+logits.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+```
+
+**5. Softmax and multinomial sampling**
+
+```python
+probs = torch.softmax(logits, dim=-1)
+return torch.multinomial(probs, num_samples=1)
+```
+
+---
+
+## Per-request override
+
+Pass a `SamplingConfig` directly to any generation method to override the engine-level default for that call only:
+
+```python
+from engine.config import SamplingConfig, EngineConfig
+
+sampling = SamplingConfig(temperature=0.3, top_p=0.95, top_k=40, repetition_penalty=1.05)
+results = engine.generate_many(prompts, sampling=sampling)
+```
+
+The engine falls back to `EngineConfig.sampling` when no per-call `sampling` argument is supplied.
+
+<Tip>
+  Set `temperature=0` to enable greedy decoding. The sampling pipeline short-circuits to `torch.argmax` immediately, making generation fully deterministic for a given prompt and tokenization. This is useful for evaluation, regression testing, or any task where reproducibility matters.
+</Tip>

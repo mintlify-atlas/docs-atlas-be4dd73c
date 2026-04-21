@@ -1,0 +1,116 @@
+---
+title: "Prefill/decode scheduler and request batching"
+description: "How LLMEngine runs two-phase inference, selects decode cohorts for batched execution, and tracks per-request latency from queue admission to completion."
+---
+
+`LLMEngine` (`engine/scheduler.py`) is a single-device scheduler that separates inference into two explicit phases: prefill, which processes the full prompt and produces the first generated token, and decode, which generates subsequent tokens one step at a time across a batch of concurrent requests. Keeping these phases separate lets the engine optimize each independently — prefill benefits from large input tensors while decode benefits from batching many requests at the same sequence length.
+
+## Prefill phase vs. decode phase
+
+During **prefill**, the engine processes the entire prompt (or a chunk of it when `prefill_chunk_size` is set) in a single forward pass. This is compute-intensive because the input tensor can be hundreds of tokens wide. The phase ends when `prompt_cursor` reaches `len(prompt_token_ids)` and a sampled token is appended; the request then moves to the decode queue.
+
+During **decode**, the engine runs one token step per request per iteration. Requests are selected as a batch using the cohort logic described below. Each step appends one new key-value pair per layer to the paged cache and samples the next token.
+
+## `LLMEngine` overview
+
+```python
+class LLMEngine:
+    def __init__(self, runtime: GemmaRuntime, config: EngineConfig):
+        self.runtime = runtime
+        self.config = config
+        self.capacity = KVBlockManager(
+            max_kv_cache_tokens=self.config.max_kv_cache_tokens,
+            block_size=self.config.kv_block_size,
+            num_blocks=self.config.num_kv_blocks,
+        )
+        self.paged_kv_caches = self.runtime.model.init_paged_kv_caches(
+            num_blocks=self.capacity.num_blocks,
+            block_size=self.capacity.block_size,
+            device=self.runtime.device,
+        )
+```
+
+`LLMEngine` owns the `KVBlockManager` and the 18 per-layer `PagedKVCache` objects. All requests share these caches; the block tables inside each `RequestState` determine which physical blocks belong to which request.
+
+## Decode batching and cohort selection
+
+`_select_decode_batch` (`engine/scheduler.py:364`) implements round-robin selection with a cohort optimization. It pulls up to `decode_selection_window` requests (default `8`) from the front of the decode queue, then groups them into cohorts by a composite key:
+
+```python
+cohort_key = (len(request.all_token_ids), self._sampling_key(request))
+```
+
+where `_sampling_key` returns `(temperature, top_p, top_k, repetition_penalty)`. Requests in the same cohort have identical total token lengths and identical sampling parameters, which means their logit tensors can be processed together in a single batched forward pass. The largest cohort (ties broken by earliest queue position) is selected up to `max_decode_batch_size` (default `4`). Requests not selected are pushed back to the front of the decode queue in their original order.
+
+## Chunked prefill
+
+When `prefill_chunk_size` is set in `EngineConfig`, the engine splits long prompts into chunks and processes one chunk per scheduling iteration. `_next_prefill_chunk` slices `prompt_token_ids[prompt_cursor : prompt_cursor + chunk_size]` and advances `prompt_cursor` after each forward pass. This caps the maximum input tensor width and lets decode steps interleave with ongoing prefills, reducing head-of-line blocking for requests already in the decode queue.
+
+## Request lifecycle
+
+<Steps>
+  <Step title="Queued">
+    A `RequestState` is created by `_build_request` and added to `prefill_queue`. Its `status` and `phase` are both `"queued"`. The request waits here until the decode queue has room (below `max_decode_batch_size`) and the KV block manager can satisfy `can_allocate_for(request, len(prompt_token_ids))`.
+  </Step>
+  <Step title="Prefill">
+    `_init_request` resets all mutable state, sets `status="active"` and `phase="prefill"`. One or more calls to `_run_prefill_chunk` process the prompt, accumulating `prefill_time_s` and `prefill_steps`. When `_prefill_complete` returns `True`, the final logits are sampled to produce the first token and the request moves to `decode_queue`.
+  </Step>
+  <Step title="Decode">
+    `_select_decode_batch` picks the request as part of a cohort. `_run_decode_batch` runs a joint forward pass, samples all next tokens, and calls `_record_next_token` for each. `decode_time_s` and `decode_steps` accumulate. The request cycles back to the decode queue after each step until a stop condition is met.
+  </Step>
+  <Step title="Finished or error">
+    `_finish_request` sets `status` to `"finished"` or `"error"`, records `finished_at_s`, and calls `_release_request_capacity` to return all KV blocks. `_make_result` assembles a `GenerationResult` with timing fields derived from the accumulated counters.
+  </Step>
+</Steps>
+
+## Stop conditions
+
+`_record_next_token` and `_prepare_paged_batch` check four stop conditions after every step:
+
+- **`eos`** — the sampled token ID equals `eos_token_id`.
+- **`max_new_tokens`** — `len(generated_ids) >= max_new_tokens` (default `180` from `EngineConfig`).
+- **`context_limit`** — `len(all_token_ids) >= context_length` (`32_768` for the 270M model).
+- **`capacity_exceeded`** — `ensure_capacity` returns `False` and no deferral is possible.
+
+## `RequestState` and `GenerationResult`
+
+Each in-flight request is tracked as a `RequestState` (`engine/types.py`):
+
+```python
+@dataclass
+class RequestState:
+    request_id: int
+    prompt_token_ids: List[int]
+    sampling: SamplingConfig
+    max_new_tokens: int
+    eos_token_id: Optional[int]
+    generated_ids: List[int]
+    all_token_ids: List[int]
+    seen_token_ids: Set[int]
+    block_table: List[int]
+    live_kv_tokens: int
+    num_computed_tokens: int
+    prompt_cursor: int
+    status: str           # "queued" | "active" | "finished" | "error"
+    phase: str            # "queued" | "prefill" | "decode" | "finished" | "error"
+    stop_reason: Optional[str]
+    created_at_s: float
+    first_scheduled_at_s: Optional[float]
+    finished_at_s: Optional[float]
+    prefill_time_s: float
+    prefill_steps: int
+    decode_time_s: float
+    decode_steps: int
+```
+
+When a request finishes, `_make_result` builds a `GenerationResult` with these timing fields:
+
+| Field | Description |
+|---|---|
+| `queue_wait_s` | Seconds between `created_at_s` and `first_scheduled_at_s` |
+| `prefill_s` | Accumulated wall time spent in prefill forward passes |
+| `decode_s` | Accumulated wall time spent in decode forward passes |
+| `total_latency_s` | Seconds between `created_at_s` and `finished_at_s` |
+| `model_tokens_per_s` | `len(generated_ids) / (prefill_s + decode_s)` |
+| `prefill_steps` | Number of prefill forward passes (>1 with chunked prefill) |
+| `decode_steps` | Number of decode forward passes |

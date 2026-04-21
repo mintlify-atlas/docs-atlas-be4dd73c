@@ -1,0 +1,104 @@
+---
+title: "EngineConfig: runtime and scheduler parameters"
+description: "Configure model selection, KV cache memory budget, decode batch sizing, and default sampling behavior for a single LLMEngine instance."
+---
+
+`EngineConfig` is a frozen dataclass that centralizes every tunable parameter for `LLMEngine`. Because it is frozen, you create one instance at startup and pass it to `LLMEngine`; the engine reads from it but never mutates it. The defaults are conservative enough to run on a single consumer GPU with 8 GB of VRAM, but you can adjust the KV cache budget, batch sizes, and token limits to match your hardware.
+
+## Import and instantiation
+
+```python
+from engine.config import EngineConfig, SamplingConfig
+
+# Use all defaults
+config = EngineConfig()
+
+# Override specific fields
+config = EngineConfig(
+    max_new_tokens=512,
+    max_kv_cache_tokens=16_384,
+    max_decode_batch_size=2,
+)
+```
+
+Because `EngineConfig` is a frozen dataclass, every field must be set at construction time. You cannot mutate an existing instance.
+
+---
+
+## Parameters
+
+<ParamField path="choose_model" type="str" default="270m">
+  Model size selector. Only `"270m"` is currently supported. Passed through to `GemmaRuntime` to build the HuggingFace repo ID (`google/gemma-3-270m` or `google/gemma-3-270m-it`).
+</ParamField>
+
+<ParamField path="use_instruct_model" type="bool" default="True">
+  When `True`, the engine loads the instruction-tuned checkpoint (`google/gemma-3-270m-it`) and automatically applies the Gemma chat template to every prompt before tokenization. Set to `False` to load the base checkpoint (`google/gemma-3-270m`) and pass raw text directly.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="int" default="180">
+  Default maximum number of tokens to generate per request. Individual calls to `generate`, `generate_many`, `generate_stream`, or `generate_stream_events` can override this with their own `max_new_tokens` argument.
+</ParamField>
+
+<ParamField path="sampling" type="SamplingConfig" default="SamplingConfig()">
+  Default sampling configuration used when no per-call `sampling` argument is supplied. See the [SamplingConfig reference](/api/sampling-config) for available fields.
+</ParamField>
+
+<ParamField path="num_prefill_workers" type="int" default="1">
+  Number of prefill workers. Must be `1` — the engine is single-device only and raises `ValueError` if this is set to any other value.
+</ParamField>
+
+<ParamField path="num_decode_workers" type="int" default="1">
+  Number of decode workers. Must be `1` — the engine is single-device only and raises `ValueError` if this is set to any other value.
+</ParamField>
+
+<ParamField path="max_decode_batch_size" type="int" default="4">
+  Maximum number of requests processed together in a single decode step. The cohort-based scheduler selects up to this many requests from the head of the decode queue. Larger values improve throughput when running many concurrent requests, but increase per-step latency.
+</ParamField>
+
+<ParamField path="decode_selection_window" type="int" default="8">
+  Number of requests inspected when selecting the decode batch. The scheduler looks at up to `max(max_decode_batch_size, decode_selection_window)` requests and picks the cohort with the most requests sharing the same sequence length and sampling parameters. Increasing this window improves batch homogeneity at the cost of a small scheduling overhead.
+</ParamField>
+
+<ParamField path="max_kv_cache_tokens" type="int" default="32768">
+  Total token budget for the paged KV cache. The engine divides this into blocks of `kv_block_size` tokens and pre-allocates all blocks at startup. Reduce this value if you run into CUDA out-of-memory errors.
+</ParamField>
+
+<ParamField path="kv_block_size" type="int" default="16">
+  Number of tokens per KV cache block. Allocation is always rounded up to a whole block, so smaller block sizes reduce internal fragmentation at the cost of slightly more bookkeeping overhead.
+</ParamField>
+
+<ParamField path="num_kv_blocks" type="Optional[int]" default="None">
+  Explicit number of KV cache blocks to allocate. When `None`, the value is derived automatically as `max_kv_cache_tokens // kv_block_size`. Set this explicitly only if you need precise block control independent of `max_kv_cache_tokens`.
+</ParamField>
+
+<ParamField path="prefill_chunk_size" type="Optional[int]" default="None">
+  When set to a positive integer, prefill processes this many tokens per forward pass instead of the full prompt at once. This limits the peak memory footprint of long prompts. When `None`, the entire prompt is prefilled in a single step.
+</ParamField>
+
+---
+
+## Example: lower-memory configuration
+
+Use this pattern when running on a GPU with limited VRAM or when serving shorter prompts:
+
+```python
+from engine.config import EngineConfig, SamplingConfig
+
+config = EngineConfig(
+    max_new_tokens=128,
+    max_kv_cache_tokens=8_192,   # ~512 MB at bfloat16 for the 270m model
+    kv_block_size=16,
+    max_decode_batch_size=2,
+    decode_selection_window=4,
+    prefill_chunk_size=256,      # prefill in 256-token chunks
+    sampling=SamplingConfig(temperature=0.7, top_p=0.9, top_k=40),
+)
+```
+
+<Tip>
+  `max_kv_cache_tokens` is the primary knob for controlling GPU VRAM usage. The KV cache for the 270m model stores bfloat16 tensors, so `32 768` tokens requires roughly 2 GB. If you see CUDA out-of-memory errors at startup, halve this value first before adjusting other parameters.
+</Tip>
+
+<Warning>
+  `num_prefill_workers` and `num_decode_workers` must both remain `1`. Setting either to a value other than `1` causes `generate_many` to raise a `ValueError` immediately. Multi-device execution is not supported in the current release.
+</Warning>

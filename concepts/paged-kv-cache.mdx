@@ -1,0 +1,84 @@
+---
+title: "Block-based paged KV cache memory management"
+description: "How the engine allocates KV memory in fixed-size blocks instead of per-request budgets, enabling incremental growth and free-pool reuse on request completion."
+---
+
+Every transformer layer accumulates key and value tensors as it processes tokens. If you reserve a full per-request memory budget up front, most of that memory sits idle until the request actually generates tokens — and you cannot admit more requests than the worst-case allocation allows. The Gemma 3 Inference Engine avoids this by managing KV memory in fixed-size blocks, allocating only what the current token count requires and returning blocks to a free pool the moment a request finishes.
+
+## The problem with per-request allocation
+
+A naive approach allocates a tensor of shape `[context_length, head_dim]` for each request at admission time. With `context_length=32_768` and multiple concurrent requests this exhausts GPU memory quickly, even if most requests finish in a few hundred tokens. Capacity is bounded by the longest possible sequence, not by actual usage.
+
+## The solution: `PagedKVCache`
+
+`PagedKVCache` (`gemma3/paged_kv.py`) stores all KV data for one transformer layer in a pre-allocated pair of block tensors:
+
+```python
+@dataclass
+class PagedKVCache:
+    k_blocks: torch.Tensor  # (num_blocks, num_kv_groups, block_size, head_dim)
+    v_blocks: torch.Tensor  # (num_blocks, num_kv_groups, block_size, head_dim)
+    block_size: int
+```
+
+Each slot in the first dimension is an independently addressable block. A request holds a `block_table: List[int]` that maps logical block slots to physical block IDs. At initialization, `Gemma3Model.init_paged_kv_caches` creates one `PagedKVCache` per transformer layer — 18 caches for the 270M model — all sharing the same `num_blocks` and `block_size`.
+
+## `KVBlockManager`
+
+`KVBlockManager` (`engine/scheduler.py`) owns the pool of free block IDs and implements three operations:
+
+**`can_allocate_for(request, total_tokens)`** — returns `True` if enough free blocks exist to cover `total_tokens` without touching the request's existing block table. Use this before admitting a new request.
+
+**`ensure_capacity(request, total_tokens)`** — extends the request's `block_table` by popping blocks from the free pool until the table covers `total_tokens`. Returns `False` and leaves the table unchanged if the pool has insufficient blocks.
+
+**`release(request)`** — appends every block ID in the request's `block_table` back to the free pool and clears the table. Called by `_finish_request` regardless of stop reason.
+
+## Configuration parameters
+
+These fields live on `EngineConfig` (`engine/config.py`):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_kv_cache_tokens` | `32_768` | Total token capacity across all blocks |
+| `kv_block_size` | `16` | Tokens per block |
+| `num_kv_blocks` | `None` (derived) | Explicit block count; if omitted, computed as `max_kv_cache_tokens // kv_block_size` |
+
+With the defaults you get `32_768 // 16 = 2_048` blocks available across all concurrent requests.
+
+## Incremental block growth
+
+A request starts with an empty `block_table`. Each scheduling step calls `ensure_capacity` with the new token count. The manager appends only the additional blocks needed — typically zero extra blocks during most decode steps since a block of 16 tokens covers 16 decode steps before a new block is needed.
+
+```python
+# Inside _prepare_paged_batch (engine/scheduler.py)
+target_tokens = request.live_kv_tokens + int(request.current_input.shape[1])
+if not self.capacity.ensure_capacity(request, target_tokens):
+    # defer or finish the request depending on the phase
+    ...
+```
+
+<Note>
+Block IDs are returned to the free pool immediately when a request finishes — whether it stopped due to `eos`, `max_new_tokens`, `context_limit`, or `capacity_exceeded`. This means a batch of short requests frees blocks continuously, allowing subsequent requests to be admitted without waiting for a full cycle to complete.
+</Note>
+
+## Allocation and release flows
+
+<Tabs>
+  <Tab title="Allocation">
+    When the engine admits a new request and runs each prefill or decode step:
+
+    1. `can_allocate_for(request, len(prompt_token_ids))` is checked at admission. If it returns `False`, the request is deferred to the prefill queue until capacity is available.
+    2. `_init_request` resets `block_table = []` and `live_kv_tokens = 0`.
+    3. Before each forward pass, `ensure_capacity(request, live_kv_tokens + chunk_size)` extends the block table as needed.
+    4. After the forward pass, `live_kv_tokens` is incremented by the number of tokens just processed.
+    5. `_append_to_paged_cache` in `GroupedQueryAttention` writes new K/V tensors into the physical slots identified by the block table.
+  </Tab>
+  <Tab title="Release">
+    When a request reaches any terminal state:
+
+    1. `_finish_request(request, reason=...)` is called with one of `eos`, `max_new_tokens`, `context_limit`, `capacity_exceeded`, or `error`.
+    2. `_release_request_capacity(request)` delegates to `KVBlockManager.release(request)`.
+    3. `release` iterates `request.block_table`, appends each block ID to `_free_block_ids`, decrements `_allocated_blocks`, and calls `block_table.clear()`.
+    4. The freed block IDs are immediately available to `ensure_capacity` for the next request that needs them.
+  </Tab>
+</Tabs>

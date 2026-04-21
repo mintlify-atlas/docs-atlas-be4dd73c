@@ -1,0 +1,141 @@
+---
+title: "Serve the OpenAI-compatible chat completions API"
+description: "Start a FastAPI server that exposes POST /v1/chat/completions, GET /healthz, and GET /readyz with streaming and non-streaming support."
+---
+
+The `openai_api` package wraps the Gemma 3 engine in a FastAPI application that speaks the OpenAI chat completions protocol. You can query it with `curl`, the `openai` Python SDK, or any tool that targets `POST /v1/chat/completions`, without changing your client code.
+
+## Start the server
+
+```bash
+python -m openai_api.run
+```
+
+This starts Uvicorn on `0.0.0.0:8000`. The server does not support `--reload` mode.
+
+## Startup behavior
+
+During startup, the FastAPI lifespan handler calls `ChatCompletionService()`, which downloads model weights, loads the tokenizer, and initializes `LLMEngine`. If model loading fails for any reason — missing access credentials, corrupt weights, or out-of-memory — the error is captured in `app.state.startup_error` and every subsequent call to `POST /v1/chat/completions` returns `503` with the error message. Startup errors surface at boot rather than on the first request, so you know immediately if the service is healthy.
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | Generate a chat completion. Returns `503` if the service is not ready. |
+| `GET` | `/healthz` | Liveness probe. Always returns `{"status": "ok"}`. |
+| `GET` | `/readyz` | Readiness probe. Returns `{"status": "ready"}` only after `ChatCompletionService` loads successfully; returns `503` otherwise. |
+
+## Streaming vs non-streaming responses
+
+Set `"stream": true` in your request body to receive a server-sent event (SSE) stream. Each chunk follows the `chat.completion.chunk` format with a `delta.content` field. The stream ends with a final chunk carrying `finish_reason` and a `data: [DONE]` sentinel line.
+
+When `"stream": false` (the default), the server runs generation in a thread pool and returns a complete `chat.completion` JSON object once all tokens are ready.
+
+## Query with query_fastapi.py
+
+`query_fastapi.py` is a zero-dependency script for querying the running server.
+
+<Steps>
+  <Step title="Non-streaming query">
+    ```bash
+    python query_fastapi.py --prompt "Give me one short line about LLM inference."
+    ```
+  </Step>
+  <Step title="Streaming query">
+    ```bash
+    python query_fastapi.py --stream --prompt "Give me one short line about LLM inference."
+    ```
+  </Step>
+  <Step title="Custom parameters">
+    ```bash
+    python query_fastapi.py \
+      --prompt "Explain paged KV cache briefly." \
+      --max-tokens 128 \
+      --temperature 0.5 \
+      --top-p 0.95 \
+      --stream
+    ```
+  </Step>
+</Steps>
+
+The `--model` flag defaults to `gemma-3-270m-it`. The `--host` flag defaults to `127.0.0.1` and `--port` to `8000`.
+
+## Query with curl
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-3-270m-it",
+    "messages": [{"role": "user", "content": "Give me one short line about LLM inference."}],
+    "max_tokens": 64,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "stream": false
+  }'
+```
+
+For a streaming response, set `"stream": true`:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-3-270m-it",
+    "messages": [{"role": "user", "content": "Explain continuous batching in one sentence."}],
+    "max_tokens": 64,
+    "stream": true
+  }'
+```
+
+## ChatCompletionRequest fields
+
+The `model` field must be exactly `"gemma-3-270m-it"`. Any other value is rejected with a validation error.
+
+| Field | Type | Default | Constraints | Description |
+|---|---|---|---|---|
+| `model` | `str` | `"gemma-3-270m-it"` | Must equal `"gemma-3-270m-it"` | Model identifier. Only one value is accepted. |
+| `messages` | `list` | — | At least 1 item | List of `{"role": ..., "content": ...}` objects. Role must be `"system"`, `"user"`, or `"assistant"`. |
+| `max_tokens` | `int` | `128` | 1–4096 | Maximum tokens to generate. |
+| `temperature` | `float` | `0.8` | 0.0–2.0 | Sampling temperature. |
+| `top_p` | `float` | `0.9` | 0.0–1.0 (exclusive 0) | Nucleus sampling threshold. |
+| `stream` | `bool` | `False` | — | Enable SSE streaming. |
+
+## Use the OpenAI Python SDK
+
+Point the `openai` client at your local server by overriding `base_url` and passing any non-empty string as the API key (no authentication is enforced by the server).
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="local",  # required by the SDK but not validated by the server
+)
+
+# Non-streaming
+response = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Explain paged KV cache in one sentence."}],
+    max_tokens=64,
+    temperature=0.8,
+)
+print(response.choices[0].message.content)
+
+# Streaming
+stream = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Give me one short line about LLM inference."}],
+    max_tokens=64,
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)
+print()
+```
+
+<Warning>
+`POST /v1/chat/completions` returns `503 Service Unavailable` if `ChatCompletionService` did not finish loading at startup. Poll `GET /readyz` and wait for a `200` response before sending completion requests. The `/healthz` endpoint always returns `200` regardless of model load state, so it is not a substitute for `/readyz` when waiting for the service to be ready.
+</Warning>

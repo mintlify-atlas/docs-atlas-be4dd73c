@@ -1,0 +1,260 @@
+---
+title: "POST /v1/chat/completions reference"
+description: "Complete reference for the chat completions endpoint: request fields, response shape, streaming SSE format, error codes, and working curl and Python examples."
+---
+
+The `/v1/chat/completions` endpoint accepts a list of chat messages and returns a generated assistant reply. You can receive the full response in a single JSON object or stream tokens incrementally using server-sent events (SSE). The endpoint is wire-compatible with the OpenAI chat completions API.
+
+## Endpoint
+
+```
+POST /v1/chat/completions
+```
+
+## Request schema
+
+### Top-level fields
+
+<ParamField body="model" type="string" required>
+  The model to use for generation. Must be `"gemma-3-270m-it"`. Any other value returns a `422` validation error.
+</ParamField>
+
+<ParamField body="messages" type="ChatMessage[]" required>
+  Ordered list of conversation messages. Must contain at least one item. Each item follows the `ChatMessage` schema described below.
+</ParamField>
+
+<ParamField body="max_tokens" type="integer" default="128">
+  Maximum number of tokens to generate. Accepts values from `1` to `4096`.
+</ParamField>
+
+<ParamField body="temperature" type="float" default="0.8">
+  Sampling temperature. Higher values produce more varied output. Accepts values from `0.0` to `2.0`.
+</ParamField>
+
+<ParamField body="top_p" type="float" default="0.9">
+  Nucleus sampling probability mass. Only tokens in the top `top_p` cumulative probability are considered. Accepts values greater than `0.0` up to `1.0`.
+</ParamField>
+
+<ParamField body="stream" type="boolean" default="false">
+  When `true`, the server streams tokens as SSE chunks. When `false`, the server returns a single JSON response after generation completes.
+</ParamField>
+
+### ChatMessage fields
+
+<ParamField body="role" type="string" required>
+  Speaker role. One of `"system"`, `"user"`, or `"assistant"`. The engine maps `"system"` and `"user"` to Gemma's `user` turn, and `"assistant"` to Gemma's `model` turn.
+</ParamField>
+
+<ParamField body="content" type="string" required>
+  Message text. Minimum 1 character, maximum 32 768 characters. Control characters and Gemma control tokens (e.g. `<start_of_turn>`) are stripped before the prompt is built.
+</ParamField>
+
+## Response schema (non-streaming)
+
+When `stream` is `false`, the server returns a single JSON object after generation finishes.
+
+```json
+{
+  "id": "chatcmpl-3f1a2b3c4d5e6f7a8b9c0d1e",
+  "object": "chat.completion",
+  "created": 1713657600,
+  "model": "gemma-3-270m-it",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "LLM inference turns learned weights into words."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 9,
+    "total_tokens": 21
+  }
+}
+```
+
+<ResponseField name="id" type="string">
+  Unique completion identifier in the format `chatcmpl-{24 hex characters}`.
+</ResponseField>
+
+<ResponseField name="object" type="string">
+  Always `"chat.completion"` for non-streaming responses.
+</ResponseField>
+
+<ResponseField name="created" type="integer">
+  Unix timestamp (seconds) when the completion was created.
+</ResponseField>
+
+<ResponseField name="model" type="string">
+  The model that generated the response. Always `"gemma-3-270m-it"`.
+</ResponseField>
+
+<ResponseField name="choices" type="object[]">
+  Array containing a single choice object.
+
+  <Expandable title="choice fields">
+    <ResponseField name="choices[].index" type="integer">
+      Always `0`. Only one choice is returned per request.
+    </ResponseField>
+    <ResponseField name="choices[].message" type="object">
+      The generated message.
+
+      <Expandable title="message fields">
+        <ResponseField name="choices[].message.role" type="string">
+          Always `"assistant"`.
+        </ResponseField>
+        <ResponseField name="choices[].message.content" type="string">
+          The generated text.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="choices[].finish_reason" type="string">
+      `"stop"` when the model hit an end-of-sequence token, the request exceeded capacity, or no other stop condition applied. `"length"` when generation was cut off by `max_tokens` or the context limit.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="usage" type="object">
+  Token counts for the request.
+
+  <Expandable title="usage fields">
+    <ResponseField name="usage.prompt_tokens" type="integer">
+      Number of tokens in the formatted prompt.
+    </ResponseField>
+    <ResponseField name="usage.completion_tokens" type="integer">
+      Number of tokens generated.
+    </ResponseField>
+    <ResponseField name="usage.total_tokens" type="integer">
+      Sum of `prompt_tokens` and `completion_tokens`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Streaming response
+
+When `stream` is `true`, the server returns an `text/event-stream` response. Each event is a `data:` line containing a JSON object with `"object": "chat.completion.chunk"`.
+
+The first chunk carries the role:
+
+```json
+{
+  "id": "chatcmpl-3f1a2b3c4d5e6f7a8b9c0d1e",
+  "object": "chat.completion.chunk",
+  "created": 1713657600,
+  "model": "gemma-3-270m-it",
+  "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+}
+```
+
+Subsequent chunks carry incremental content tokens:
+
+```json
+{
+  "id": "chatcmpl-3f1a2b3c4d5e6f7a8b9c0d1e",
+  "object": "chat.completion.chunk",
+  "created": 1713657600,
+  "model": "gemma-3-270m-it",
+  "choices": [{"index": 0, "delta": {"content": "LLM"}, "finish_reason": null}]
+}
+```
+
+The final chunk has an empty `delta` and a non-null `finish_reason`:
+
+```json
+{
+  "id": "chatcmpl-3f1a2b3c4d5e6f7a8b9c0d1e",
+  "object": "chat.completion.chunk",
+  "created": 1713657600,
+  "model": "gemma-3-270m-it",
+  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+}
+```
+
+The stream closes with a sentinel line:
+
+```
+data: [DONE]
+```
+
+## Error responses
+
+| Status | Condition |
+|--------|-----------|
+| `422` | Request validation failed (e.g. unsupported model name, missing `messages`, out-of-range parameter) |
+| `503` | The model has not finished loading or failed to load at startup |
+| `500` | An internal error occurred during generation |
+
+## Examples
+
+### curl — non-streaming
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-3-270m-it",
+    "messages": [{"role": "user", "content": "Give me one short line about LLM inference."}],
+    "max_tokens": 64,
+    "temperature": 0.8,
+    "top_p": 0.9
+  }'
+```
+
+### curl — streaming
+
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-3-270m-it",
+    "messages": [{"role": "user", "content": "Give me one short line about LLM inference."}],
+    "max_tokens": 64,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "stream": true
+  }'
+```
+
+### Python — OpenAI SDK (non-streaming)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Give me one short line about LLM inference."}],
+    max_tokens=64,
+    temperature=0.8,
+    top_p=0.9,
+)
+
+print(response.choices[0].message.content)
+```
+
+### Python — OpenAI SDK (streaming)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+with client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Give me one short line about LLM inference."}],
+    max_tokens=64,
+    temperature=0.8,
+    top_p=0.9,
+    stream=True,
+) as stream:
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+print()
+```

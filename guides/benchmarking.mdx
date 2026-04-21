@@ -1,0 +1,143 @@
+---
+title: "Benchmark throughput and latency"
+description: "Run the three included benchmark scripts to measure concurrent request throughput, chunked prefill latency, and per-request generation metrics."
+---
+
+The repository ships three benchmark scripts that exercise the engine directly — no HTTP server required. Each script builds an `LLMEngine` instance, runs a set of prompts through `generate_many`, and prints per-request latency breakdowns and aggregate summaries. Before running any benchmark, install the optional `pandas` dependency used for tabular output.
+
+## Install benchmark dependency
+
+```bash
+python -m pip install pandas
+```
+
+## Benchmark scripts
+
+<CodeGroup>
+
+```bash Concurrent 10-request benchmark
+python scripts/benchmark_concurrent_10.py
+```
+
+```bash Chunked prefill with long prompts
+python scripts/benchmark_chunked_prefill_long_prompts.py
+```
+
+```bash Demo chunked prefill
+python scripts/demo_chunked_prefill.py
+```
+
+</CodeGroup>
+
+### benchmark_concurrent_10.py
+
+Submits 10 prompts simultaneously to `generate_many` and prints a `pandas` DataFrame of per-request metrics followed by an aggregate summary line. The engine is configured with `max_new_tokens=32` and greedy sampling (`temperature=0.0`, `top_k=0`, `repetition_penalty=1.0`) for deterministic, reproducible results.
+
+```python
+engine = LLMEngine(
+    runtime=runtime,
+    config=EngineConfig(
+        choose_model="270m",
+        use_instruct_model=True,
+        max_new_tokens=32,
+        sampling=SamplingConfig(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
+        ),
+    ),
+)
+results = engine.generate_many(prompts)
+```
+
+The output includes a `baseline_summary` line with per-request averages:
+
+```
+baseline_summary avg_queue_wait_s=0.0012 avg_prefill_s=0.3241 avg_decode_s=0.8104 avg_total_s=1.1357 avg_tok_per_s=28.47
+completed=10/10 elapsed_s=11.234
+```
+
+### benchmark_chunked_prefill_long_prompts.py
+
+Runs two back-to-back benchmarks on the same set of long prompts — once without chunking (`prefill_chunk_size=None`) and once with a configurable chunk size — then prints a comparison. Long prompts are synthesized by repeating short seed sentences (default: 4 prompts × 40 repetitions).
+
+```bash
+python scripts/benchmark_chunked_prefill_long_prompts.py \
+  --num-prompts 4 \
+  --repeat 40 \
+  --chunk-size 64 \
+  --max-new-tokens 32 \
+  --warmup-runs 1 \
+  --benchmark-runs 3
+```
+
+The output shows `no_chunk` and `chunked` summaries, then a `speed_ratio_no_chunk_over_chunked` line. A ratio above `1.0` means chunked prefill was faster for the given workload.
+
+### demo_chunked_prefill.py
+
+Demonstrates chunked prefill on a single repeated prompt. Runs the prompt twice — once without chunking and once with a small chunk size — and prints `prefill_steps`, `decode_steps`, `generated_tokens`, and `end_to_end_tok_per_s` for each run.
+
+```bash
+python scripts/demo_chunked_prefill.py \
+  --chunk-size 16 \
+  --repeat 40 \
+  --warmup-runs 1 \
+  --benchmark-runs 3 \
+  --prompt "Explain KV cache reuse in one short paragraph. "
+```
+
+## GenerationResult metrics
+
+Every result returned by `generate_many` or `generate_stream` is a `GenerationResult` with the following timing and step-count fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `queue_wait_s` | `float` | Seconds the request spent waiting in the prefill queue before its first scheduled step. |
+| `prefill_s` | `float` | Total wall-clock time spent in prefill forward passes. |
+| `decode_s` | `float` | Total wall-clock time spent in decode forward passes. |
+| `total_latency_s` | `float` | End-to-end time from request creation to last generated token. |
+| `model_tokens_per_s` | `float` | Generated tokens divided by `prefill_s + decode_s`. Measures model throughput excluding queue wait. |
+| `prefill_steps` | `int` | Number of prefill forward passes. Greater than 1 when `prefill_chunk_size` is set. |
+| `decode_steps` | `int` | Number of decode forward passes, equal to the number of tokens generated. |
+
+Access these fields directly on each result object:
+
+```python
+results = engine.generate_many(prompts)
+for result in results:
+    print(
+        f"request_id={result.request_id} "
+        f"queue_wait_s={result.queue_wait_s:.4f} "
+        f"prefill_s={result.prefill_s:.4f} "
+        f"decode_s={result.decode_s:.4f} "
+        f"total_latency_s={result.total_latency_s:.4f} "
+        f"model_tokens_per_s={result.model_tokens_per_s:.2f} "
+        f"prefill_steps={result.prefill_steps} "
+        f"decode_steps={result.decode_steps}"
+    )
+```
+
+## Load test environment variables
+
+The load test suite (`tests/test_llmengine_load_real.py`) reads three optional environment variables to override default pass/fail thresholds:
+
+| Variable | Description |
+|---|---|
+| `LOAD_MAX_ERROR_RATE` | Maximum fraction of requests that may fail before the test fails. |
+| `LOAD_MAX_P95_TOTAL_S` | Maximum allowed p95 end-to-end latency in seconds. |
+| `LOAD_MIN_THROUGHPUT_TPS` | Minimum required throughput in tokens per second. |
+
+Set these before running the load tests:
+
+```bash
+LOAD_MAX_ERROR_RATE=0.0 \
+LOAD_MAX_P95_TOTAL_S=30.0 \
+LOAD_MIN_THROUGHPUT_TPS=5.0 \
+RUN_REAL_ENGINE_TESTS=1 RUN_REAL_ENGINE_LOAD_TESTS=1 \
+python -m unittest -q tests/test_llmengine_load_real.py
+```
+
+<Note>
+The three benchmark scripts run the model directly and require the `gemma-3-270m-it` checkpoint to be downloaded locally (or available via HuggingFace). The `RUN_REAL_ENGINE_TESTS=1` environment variable is only needed for the test suite under `tests/` — it is not read by the benchmark scripts.
+</Note>

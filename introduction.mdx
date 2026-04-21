@@ -1,0 +1,61 @@
+---
+title: "Gemma 3 Inference Engine: overview and key concepts"
+description: "A minimal, readable PyTorch implementation of vLLM-style LLM inference featuring paged KV cache, continuous batching, and an OpenAI-compatible chat API."
+---
+
+Gemma 3 Inference Engine is a clean, minimal PyTorch codebase for running LLM inference with the `google/gemma-3-270m-it` model. It is built for engineers and researchers who want to understand how modern inference engines work — from block-based paged KV allocation to continuous prefill/decode scheduling — without wading through production complexity. If you want a readable reference implementation that you can run locally, extend, and learn from, this project is for you.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Paged KV cache" icon="memory">
+    Allocates KV memory in fixed-size blocks as requests grow, matching the core vLLM idea: admit requests cheaply, grow cache usage incrementally, and free blocks immediately on completion.
+  </Card>
+  <Card title="Continuous batching" icon="list-check">
+    A prefill/decode scheduler runs multiple requests concurrently with round-robin decode ordering, maximizing throughput without a full rewrite of the generation loop.
+  </Card>
+  <Card title="OpenAI-compatible API" icon="server">
+    A FastAPI app exposes `POST /v1/chat/completions` with streaming support, plus `/healthz` and `/readyz` probes for readiness-aware startup.
+  </Card>
+  <Card title="Readable architecture" icon="book-open">
+    18-layer decoder with mixed sliding and full attention, GQA, RoPE, and Gemma-style RMSNorm — each component kept small enough to read and modify directly.
+  </Card>
+</CardGroup>
+
+## Project structure
+
+The repository is organized into focused directories, each with a clear responsibility:
+
+| Directory / file | Purpose |
+|---|---|
+| `gemma3/` | Model components: attention, feedforward, RMSNorm, RoPE, paged KV storage, and weight mapping |
+| `engine/` | Runtime: request scheduler, block-based KV allocator, decode batching, and token sampling |
+| `openai_api/` | FastAPI application: request schemas, chat prompt formatting, and the completion service |
+| `main.py` | Entry point for direct local generation without the API server |
+| `tests/` | Scheduler unit tests and optional real-engine regression and load tests |
+
+## Prerequisites
+
+Before you run the project, make sure you have the following in place.
+
+**Python dependencies**
+
+Install all required packages with a single command:
+
+```bash
+python -m pip install torch tokenizers safetensors huggingface_hub fastapi uvicorn pydantic starlette
+```
+
+If you plan to run the optional benchmark scripts, also install:
+
+```bash
+python -m pip install pandas
+```
+
+**HuggingFace model access**
+
+The engine downloads weights from `google/gemma-3-270m` or `google/gemma-3-270m-it` on HuggingFace. You must request and receive approval for Gemma model access before the first download. If you already have the weight files locally in `gemma-3-270m/` or `gemma-3-270m-it/`, the engine reuses them and skips the download.
+
+## Next steps
+
+Once your environment is ready, follow the [quickstart](/quickstart) to run your first inference.

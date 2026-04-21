@@ -1,0 +1,95 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Gemma 3 Inference Engine",
+  "projectDescription": "A minimal, readable PyTorch implementation of Gemma-3-style inference with a vLLM-inspired paged KV cache scheduler and an OpenAI-compatible chat API.",
+  "theme": "luma",
+  "primaryColor": "#4F6AF5",
+  "lightColor": "#EEF1FD",
+  "darkColor": "#1A1F3C",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/paged-kv-cache",
+              "concepts/scheduler"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/direct-inference",
+              "guides/api-server",
+              "guides/configuration",
+              "guides/benchmarking"
+            ]
+          },
+          {
+            "group": "Testing",
+            "pages": [
+              "testing/unit-tests",
+              "testing/load-tests"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "HTTP API",
+            "pages": [
+              "api/overview",
+              "api/chat-completions",
+              "api/health"
+            ]
+          },
+          {
+            "group": "Python API",
+            "pages": [
+              "api/llm-engine",
+              "api/engine-config",
+              "api/sampling-config",
+              "api/gemma-runtime"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Block-based paged KV cache allocator inspired by vLLM",
+    "Continuous multi-request scheduling with prefill/decode batching",
+    "OpenAI-compatible POST /v1/chat/completions endpoint with streaming SSE support",
+    "18-layer Gemma-3 decoder with mixed sliding-window and full attention",
+    "Grouped Query Attention (GQA) with RoPE (local/global bases)",
+    "Chunked prefill support for long prompts",
+    "Liveness and readiness probes (/healthz, /readyz)",
+    "Support for cuda, mps, and cpu devices"
+  ],
+  "publicApiSurface": [
+    "LLMEngine.generate(prompt) -> str",
+    "LLMEngine.generate_many(prompts) -> List[GenerationResult]",
+    "LLMEngine.generate_stream(prompt) -> Iterator[str]",
+    "LLMEngine.generate_stream_events(prompt) -> Iterator[StreamEvent]",
+    "GemmaRuntime(choose_model, use_instruct_model, device)",
+    "EngineConfig(choose_model, max_new_tokens, sampling, max_kv_cache_tokens, kv_block_size, ...)",
+    "SamplingConfig(temperature, top_p, top_k, repetition_penalty)",
+    "POST /v1/chat/completions",
+    "GET /healthz",
+    "GET /readyz",
+    "build_gemma3_270m() -> Gemma3Model",
+    "KVBlockManager(max_kv_cache_tokens, block_size, num_blocks)"
+  ]
+}
